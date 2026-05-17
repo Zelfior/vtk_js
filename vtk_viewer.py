@@ -108,8 +108,9 @@ def polydata_to_dict(poly):
         np_arr = _vtk_to_numpy(arr)
 
         point_data[name] = {
-            "buffer": _pack(np_arr, np.float32),
+            "buffer": memoryview(np_arr).tobytes(),
             "components": arr.GetNumberOfComponents(),
+            "dtype": str(np_arr.dtype),
         }
 
     # -------------------------------------------------------------------------
@@ -166,7 +167,36 @@ def create_uniform_structured_grid(nx, ny, nz, spacing=1.0):
                 )
 
     grid.SetPoints(pts)
-    grid.cell_data["cell_id"] = np.arange((nx - 1) * (ny - 1) * (nz - 1), dtype=np.float32)
+    n_cells = (nx - 1) * (ny - 1) * (nz - 1)
+
+    cell_id = np.arange(n_cells, dtype=np.float32)
+
+    x = np.arange((nx - 1), dtype=np.float32) / (nx - 2)
+    y = np.arange((ny - 1), dtype=np.float32) / (ny - 2)
+    z = np.arange((nz - 1), dtype=np.float32) / (nz - 2)
+
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')  # 'ij' for Cartesian indexing
+
+    X = X.flatten()
+    Y = Y.flatten()
+    Z = Z.flatten()
+
+    rgb = np.stack(
+        [
+            X,          # red
+            Y,    # green
+            Z,    # blue
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    print(rgb.max(), rgb.min())
+
+    grid.cell_data["cell_id"] = cell_id
+    grid.cell_data["cell_value"] = X
+    grid.cell_data["rgb"] = rgb
+
+    print(grid.cell_data["rgb"])
 
     return grid
 
@@ -187,7 +217,8 @@ def structured_to_polydata(grid):
 class VTKCone(JSComponent):
 
     resolution = param.Integer(default=10, bounds=(4, 80))
-    representation = param.Integer(default=2, bounds=(0, 2))
+    cmap = param.Selector(default="viridis", objects=["viridis", "plasma", "inferno", "magma"])
+    info = param.Boolean(default=True)
 
     vtp_data = param.Dict()
 
@@ -202,19 +233,23 @@ class VTKCone(JSComponent):
     def __init__(self, **params):
 
         super().__init__(**params)
+        self._update_vtp_data()
 
+        self.param.watch(self._update_vtp_data, "resolution")
+        self.param.watch(self._update_vtp_data, "cmap")
+
+    def _update_vtp_data(self, event=None):
+        print("Updating VTK data to resolution:", self.resolution)
         grid = create_uniform_structured_grid(
             nx=self.resolution,
             ny=self.resolution,
             nz=self.resolution,
-            spacing=1.0,
+            spacing=1.0 / self.resolution,
         )
 
         poly = structured_to_polydata(grid)
 
         self.vtp_data = polydata_to_dict(poly)
-
-        print(self.vtp_data)
 
 
 # =============================================================================
@@ -227,33 +262,33 @@ if __name__ == "__main__":
         name="Resolution",
         start=4,
         end=80,
-        width=150,
+        sizing_mode="stretch_width",
+        value=10,
     )
 
-    representation_selector = pmui.Select(
-        name="Representation",
-        options=["Points", "Wireframe", "Surface"],
-        width=150,
+    cmap = pmui.Select(
+        name="Colormap",
+        options=["viridis", "plasma", "inferno", "magma"],
+        sizing_mode="stretch_width",
+    )
+
+    info_checkbox = pmui.Checkbox(
+        name="Show Info",
+        value=True,
     )
 
     vtk_view = VTKCone(sizing_mode="stretch_both")
 
     resolution_slider.link(vtk_view, value="resolution")
-
-    def update_rep(event):
-        vtk_view.representation = {
-            "Points": 0,
-            "Wireframe": 1,
-            "Surface": 2,
-        }[event.new]
-
-    representation_selector.param.watch(update_rep, "value")
+    cmap.link(vtk_view, value="cmap")
+    info_checkbox.link(vtk_view, value="info")
 
     pmui.Row(
         pmui.Column(
             resolution_slider,
-            representation_selector,
-            width=200,
+            cmap,
+            info_checkbox,
+            width=300,
         ),
         vtk_view,
         sizing_mode="stretch_both",
