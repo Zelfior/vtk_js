@@ -214,7 +214,7 @@ def structured_to_polydata(grid):
 # Panel Component
 # =============================================================================
 
-class VTKCone(JSComponent):
+class VTKPlotter(JSComponent):
 
     resolution = param.Integer(default=10, bounds=(4, 80))
     cmap = param.Selector(default="viridis", objects=["viridis", "plasma", "inferno", "magma"])
@@ -277,7 +277,7 @@ if __name__ == "__main__":
         value=True,
     )
 
-    vtk_view = VTKCone(sizing_mode="stretch_both")
+    vtk_view = VTKPlotter(sizing_mode="stretch_both")
 
     resolution_slider.link(vtk_view, value="resolution")
     cmap.link(vtk_view, value="cmap")

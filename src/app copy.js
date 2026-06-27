@@ -2,233 +2,253 @@ import '@kitware/vtk.js/Rendering/Profiles/Geometry';
 
 import vtkGenericRenderWindow from '@kitware/vtk.js/Rendering/Misc/GenericRenderWindow';
 
+import vtkPolyData from '@kitware/vtk.js/Common/DataModel/PolyData';
+import vtkPoints from '@kitware/vtk.js/Common/Core/Points';
+import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
+import vtkCellArray from '@kitware/vtk.js/Common/Core/CellArray';
+
 import vtkActor from '@kitware/vtk.js/Rendering/Core/Actor';
 import vtkMapper from '@kitware/vtk.js/Rendering/Core/Mapper';
 
-import vtkCalculator from '@kitware/vtk.js/Filters/General/Calculator';
-import vtkConeSource from '@kitware/vtk.js/Filters/Sources/ConeSource';
-
-import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
-import vtkCutter from '@kitware/vtk.js/Filters/Core/Cutter';
-
-import vtkImplicitPlaneWidget from '@kitware/vtk.js/Widgets/Widgets3D/ImplicitPlaneWidget';
-import vtkWidgetManager from '@kitware/vtk.js/Widgets/Core/WidgetManager';
-
-import {
-  AttributeTypes,
-} from '@kitware/vtk.js/Common/DataModel/DataSetAttributes/Constants';
-
-import {
-  FieldDataTypes,
-} from '@kitware/vtk.js/Common/DataModel/DataSet/Constants';
+import vtkCellPicker from '@kitware/vtk.js/Rendering/Core/CellPicker';
 
 export function render({ model, el }) {
 
   // ----------------------------------------------------------------------------
-  // Render window
+  // Renderer setup
   // ----------------------------------------------------------------------------
 
   const genericRenderWindow = vtkGenericRenderWindow.newInstance();
-
   genericRenderWindow.setContainer(el);
 
   el.style.width = '100%';
   el.style.height = '100%';
   el.style.overflow = 'hidden';
+  el.style.position = 'relative';
 
   genericRenderWindow.resize();
 
   const renderer = genericRenderWindow.getRenderer();
   const renderWindow = genericRenderWindow.getRenderWindow();
 
-  renderer.setBackground(1.0, 1.0, 1.0);
+  renderer.setBackground(1, 1, 1);
 
   // ----------------------------------------------------------------------------
-  // Cone source
+  // Tooltip
   // ----------------------------------------------------------------------------
 
-  const coneSource = vtkConeSource.newInstance({
-    height: 5.0,
-    radius: 2.0,
-    resolution: model.resolution,
-    capping: true,
-  });
+  const tooltip = document.createElement('div');
+
+  tooltip.style.position = 'absolute';
+  tooltip.style.pointerEvents = 'none';
+  tooltip.style.background = 'rgba(0,0,0,0.8)';
+  tooltip.style.color = 'white';
+  tooltip.style.padding = '6px 8px';
+  tooltip.style.fontSize = '12px';
+  tooltip.style.fontFamily = 'monospace';
+  tooltip.style.borderRadius = '4px';
+  tooltip.style.whiteSpace = 'nowrap';
+  tooltip.style.display = 'none';
+  tooltip.style.zIndex = '100';
+
+  el.appendChild(tooltip);
 
   // ----------------------------------------------------------------------------
-  // Random scalar calculator
+  // Helpers
   // ----------------------------------------------------------------------------
 
-  const filter = vtkCalculator.newInstance();
+  function toTyped(buffer, dtype) {
+    if (!buffer) return null;
 
-  filter.setInputConnection(coneSource.getOutputPort());
+    switch (dtype) {
+      case 'uint8': return new Uint8Array(buffer);
+      case 'float32':
+      default: return new Float32Array(buffer);
+    }
+  }
 
-  let scalars = null;
+  function makeCellArray(cell) {
+    if (!cell || !cell.buffer) return null;
 
-  filter.setFormula({
+    const values = new Uint32Array(cell.buffer);
 
-    getArrays: (inputDataSets) => {
+    const vtkArr = vtkCellArray.newInstance();
+    vtkArr.setData(values);
 
-      const dataSet = inputDataSets[0];
-      const numCells = dataSet.getNumberOfCells();
-
-      if (!scalars || scalars.length !== numCells) {
-        scalars = new Float32Array(numCells);
-      }
-
-      return {
-        input: [],
-        output: [
-          {
-            location: FieldDataTypes.CELL,
-            name: 'Random',
-            dataType: 'Float32Array',
-            attribute: AttributeTypes.SCALARS,
-            data: scalars,
-          },
-        ],
-      };
-    },
-
-    evaluate: (arraysIn, arraysOut) => {
-
-      const outputScalars = arraysOut[0].getData();
-
-      for (let i = 0; i < outputScalars.length; i++) {
-        outputScalars[i] = Math.random();
-      }
-    },
-  });
+    return vtkArr;
+  }
 
   // ----------------------------------------------------------------------------
-  // Main cone actor
+  // Pipeline
   // ----------------------------------------------------------------------------
+
+  const polyData = vtkPolyData.newInstance();
 
   const mapper = vtkMapper.newInstance();
-
-  mapper.setInputConnection(filter.getOutputPort());
+  mapper.setInputData(polyData);
   mapper.setScalarVisibility(true);
+  mapper.setScalarModeToUseCellFieldData();
+  mapper.setColorModeToDirectScalars();
+  mapper.setColorByArrayName('rgba');
 
   const actor = vtkActor.newInstance();
-
   actor.setMapper(mapper);
+  actor.setForceTranslucent(true);
 
   renderer.addActor(actor);
 
   // ----------------------------------------------------------------------------
-  // Cutting plane
+  // Picker
   // ----------------------------------------------------------------------------
 
-  const plane = vtkPlane.newInstance({
-    origin: [0, 0, 0],
-    normal: [1, 0, 0],
-  });
+  const picker = vtkCellPicker.newInstance();
+  picker.setPickFromList(true);
+  picker.initializePickList();
+  picker.addPickList(actor);
 
   // ----------------------------------------------------------------------------
-  // Cutter
+  // Update polydata
   // ----------------------------------------------------------------------------
 
-  const cutter = vtkCutter.newInstance();
+  function updatePolyData(data) {
 
-  cutter.setCutFunction(plane);
+    if (!data) return;
 
-  cutter.setInputConnection(filter.getOutputPort());
+    const pts = toTyped(data.points?.buffer, data.points?.dtype || 'float32');
 
-  const sliceMapper = vtkMapper.newInstance();
+    if (pts) {
+      const points = vtkPoints.newInstance();
+      points.setData(pts, 3);
+      polyData.setPoints(points);
+    }
 
-  sliceMapper.setInputConnection(cutter.getOutputPort());
+    polyData.setPolys(makeCellArray(data.polys));
+    polyData.setLines(makeCellArray(data.lines));
+    polyData.setVerts(makeCellArray(data.verts));
+    polyData.setStrips(makeCellArray(data.strips));
 
-  const sliceActor = vtkActor.newInstance();
+    polyData.getPointData().initialize();
+    polyData.getCellData().initialize();
 
-  sliceActor.setMapper(sliceMapper);
+    const cellData = data.cellData || {};
 
-  sliceActor.getProperty().setColor(1, 0, 0);
-  sliceActor.getProperty().setLineWidth(5);
+    Object.entries(cellData).forEach(([name, entry]) => {
 
-  renderer.addActor(sliceActor);
+      const arr = toTyped(entry.buffer, entry.dtype || 'float32');
 
-  // ----------------------------------------------------------------------------
-  // Widget manager
-  // ----------------------------------------------------------------------------
+      if (!arr) return;
 
-  const widgetManager = vtkWidgetManager.newInstance();
+      const vtkArr = vtkDataArray.newInstance({
+        name,
+        values: arr,
+        numberOfComponents: entry.components || 1,
+      });
 
-  widgetManager.setRenderer(renderer);
+      polyData.getCellData().addArray(vtkArr);
+    });
 
-  // ----------------------------------------------------------------------------
-  // Plane widget
-  // ----------------------------------------------------------------------------
-
-  const planeWidget = vtkImplicitPlaneWidget.newInstance();
-
-  const widget = widgetManager.addWidget(planeWidget);
-
-  widget.placeWidget(actor.getBounds());
-
-  widget.setPlaceFactor(1.25);
-
-  widgetManager.enablePicking();
-
-  // ----------------------------------------------------------------------------
-  // Widget interaction
-  // ----------------------------------------------------------------------------
-
-  widget.onInteractionEvent(() => {
-
-    const state = widget.getWidgetState();
-
-    const origin = state.getOrigin();
-    const normal = state.getNormal();
-
-    plane.setOrigin(...origin);
-    plane.setNormal(...normal);
-
-    cutter.modified();
+    polyData.modified();
+    mapper.modified();
 
     renderWindow.render();
-  });
+  }
 
-  // ----------------------------------------------------------------------------
-  // Initial render
-  // ----------------------------------------------------------------------------
+  updatePolyData(model.vtp_data);
 
   renderer.resetCamera();
-
   renderWindow.render();
 
   // ----------------------------------------------------------------------------
-  // Resize support
+  // Hover logic (gated)
+  // ----------------------------------------------------------------------------
+
+  let hoverEnabled = !!model.info;
+
+  function onMouseMove(e) {
+
+    if (!hoverEnabled) return;
+
+    const rect = el.getBoundingClientRect();
+
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const vtkY = rect.height - y;
+
+    picker.pick([x, vtkY, 0], renderer);
+
+    const id = picker.getCellId();
+
+    if (id < 0) {
+      tooltip.style.display = 'none';
+      return;
+    }
+
+    const world = picker.getPickPosition();
+
+    const cellData = polyData.getCellData();
+
+    const cellIdArray = cellData.getArrayByName('cell_id');
+    const rgbaArray = cellData.getArrayByName('rgba');
+
+    const cellValue = cellIdArray ? cellIdArray.getValue(id) : 'N/A';
+    const rgba = rgbaArray ? rgbaArray.getTuple(id) : null;
+
+    tooltip.innerHTML = `
+      <div><b>cell_id</b>: ${id}</div>
+      <div><b>value</b>: ${cellValue}</div>
+      <div><b>xyz</b>: ${world.map(v => v.toFixed(4)).join(', ')}</div>
+      ${rgba ? `<div><b>rgba</b>: ${rgba.map(v => Math.round(v)).join(', ')}</div>` : ''}
+    `;
+
+    tooltip.style.left = `${x + 12}px`;
+    tooltip.style.top = `${y + 12}px`;
+    tooltip.style.display = 'block';
+  }
+
+  function onMouseLeave() {
+    tooltip.style.display = 'none';
+  }
+
+  function enableHover(enable) {
+
+    hoverEnabled = enable;
+
+    tooltip.style.display = 'none';
+  }
+
+  // attach once
+  el.addEventListener('mousemove', onMouseMove);
+  el.addEventListener('mouseleave', onMouseLeave);
+
+  // ----------------------------------------------------------------------------
+  // React to model.info changes
+  // ----------------------------------------------------------------------------
+
+  const onModelChange = () => {
+
+    updatePolyData(model.vtp_data);
+
+    const next = !!model.info;
+
+    if (next !== hoverEnabled) {
+      enableHover(next);
+    }
+  };
+
+  model.on?.('change:vtp_data', onModelChange);
+  model.on?.('change:info', onModelChange);
+
+  // ----------------------------------------------------------------------------
+  // Resize
   // ----------------------------------------------------------------------------
 
   const resizeObserver = new ResizeObserver(() => {
-
     genericRenderWindow.resize();
-
     renderWindow.render();
   });
 
   resizeObserver.observe(el);
-
-  // ----------------------------------------------------------------------------
-  // Model updates
-  // ----------------------------------------------------------------------------
-
-  model.on('resolution', () => {
-
-    coneSource.setResolution(model.resolution);
-
-    filter.modified();
-
-    renderWindow.render();
-  });
-
-  model.on('representation', () => {
-
-    actor
-      .getProperty()
-      .setRepresentation(model.representation);
-
-    renderWindow.render();
-  });
 
   // ----------------------------------------------------------------------------
   // Cleanup
@@ -238,7 +258,13 @@ export function render({ model, el }) {
 
     resizeObserver.disconnect();
 
-    widgetManager.delete();
+    el.removeEventListener('mousemove', onMouseMove);
+    el.removeEventListener('mouseleave', onMouseLeave);
+
+    model.off?.('change:vtp_data', onModelChange);
+    model.off?.('change:info', onModelChange);
+
+    tooltip.remove();
 
     genericRenderWindow.delete();
   };
