@@ -1,22 +1,20 @@
 import param
-import vtk
 import numpy as np
 import panel_material_ui as pmui
 from plotter import VTKPlotter, polydata_to_dict
 import matplotlib.pyplot as plt  # For colormaps
+import pyvista as pv
 
 # =============================================================================
 # Geometry creation
 # =============================================================================
-def set_color(polydata: vtk.vtkPolyData, cmap: str = "viridis"):
+def set_color(polydata: pv.PolyData, cmap: str = "viridis"):
     """
-    Set color for the given vtkPolyData using the specified colormap.
+    Set color for the given pyvista.PolyData using the specified colormap.
     If the 'rgb' array already exists, it is replaced; otherwise, it is added.
     """
-    # Get the cell_value array
-    cell_data = polydata.GetCellData()
-    cell_value_array = cell_data.GetArray("cell_value")
-    cell_value = vtk.util.numpy_support.vtk_to_numpy(cell_value_array)
+    # Get the cell_values array
+    cell_value = polydata["cell_value"]
 
     # Normalize cell_value to [0, 1]
     norm_values = (cell_value - cell_value.min()) / (cell_value.max() - cell_value.min())
@@ -25,95 +23,83 @@ def set_color(polydata: vtk.vtkPolyData, cmap: str = "viridis"):
     cmap_obj = plt.get_cmap(cmap)
     rgb = cmap_obj(norm_values)[:, :3]  # Get RGB (ignore alpha)
 
-    # Convert RGB to VTK array
-    rgb_array = vtk.util.numpy_support.numpy_to_vtk(
-        rgb, deep=True, array_type=vtk.VTK_FLOAT
-    )
-    rgb_array.SetNumberOfComponents(3)
-    rgb_array.SetName("rgb")
-
-    # Remove existing 'rgb' array if it exists
-    if cell_data.GetArray("rgb") is not None:
-        cell_data.RemoveArray("rgb")
-
-    # Add the new RGB array
-    cell_data.AddArray(rgb_array)
+    # Assign the RGB array to cell data
+    polydata["rgb"] = rgb
 
 def create_uniform_structured_grid(nx, ny, nz, spacing=1.0, cmap="viridis"):
-    grid = vtk.vtkStructuredGrid()
-    grid.SetDimensions(nx, ny, nz)
-
-    pts = vtk.vtkPoints()
-
-    for k in range(nz):
-        for j in range(ny):
-            for i in range(nx):
-                pts.InsertNextPoint(
-                    i * spacing,
-                    j * spacing,
-                    k * spacing,
-                )
-
-    grid.SetPoints(pts)
+    """Create a uniform structured grid using pyvista"""
+    # Create coordinate arrays matching the original vtk behavior
+    x = np.arange(nx, dtype=np.float32) * spacing / nx
+    y = np.arange(ny, dtype=np.float32) * spacing / ny
+    z = np.arange(nz, dtype=np.float32) * spacing / nz
+    
+    # Create meshgrid for the structured grid (structured grid expects this format)
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    
+    # Create structured grid directly from coordinate arrays
+    grid = pv.StructuredGrid(X, Y, Z)
+    
+    # Calculate cell values matching original vtk behavior
     n_cells = (nx - 1) * (ny - 1) * (nz - 1)
     cell_id = np.arange(n_cells, dtype=np.float32)
-
-    x = np.arange((nx - 1), dtype=np.float32) / (nx - 2)
-    y = np.arange((ny - 1), dtype=np.float32) / (ny - 2)
-    z = np.arange((nz - 1), dtype=np.float32) / (nz - 2)
-
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    X = X.flatten()
-    Y = Y.flatten()
-    Z = Z.flatten()
-
+    
+    # Handle edge cases for normalization (avoid division by zero)
+    x_norm = np.arange(max(nx - 1, 1), dtype=np.float32)
+    y_norm = np.arange(max(ny - 1, 1), dtype=np.float32)
+    z_norm = np.arange(max(nz - 1, 1), dtype=np.float32)
+    
+    if nx > 1:
+        x_norm = x_norm / (nx - 2) if nx > 2 else x_norm
+    if ny > 1:
+        y_norm = y_norm / (ny - 2) if ny > 2 else y_norm
+    if nz > 1:
+        z_norm = z_norm / (nz - 2) if nz > 2 else z_norm
+    
+    X_c, Y_c, Z_c = np.meshgrid(x_norm, y_norm, z_norm, indexing='ij')
+    cell_value = X_c.flatten()
+    
+    # Ensure cell data arrays match the number of cells
+    if len(cell_value) != n_cells:
+        # Trim or pad to match
+        cell_value = cell_value[:n_cells]
+        if len(cell_value) < n_cells:
+            cell_value = np.pad(cell_value, (0, n_cells - len(cell_value)))
+    
     grid.cell_data["cell_id"] = cell_id
-    grid.cell_data["cell_value"] = X
+    grid.cell_data["cell_value"] = cell_value
+    
+    # Convert to PolyData for visualization
+    poly = grid.extract_geometry()
+    set_color(poly, cmap=cmap)
+    
+    return poly
 
-    set_color(grid, cmap=cmap)
-
-    return grid
-
-def create_sliced_sphere(theta_count: int, phi_count: int, cmap="viridis") -> vtk.vtkPolyData:
-    sphere: vtk.vtkSphereSource = vtk.vtkSphereSource()
-    sphere.SetThetaResolution(theta_count)
-    sphere.SetPhiResolution(phi_count)
-    sphere.Update()
-
-    polydata: vtk.vtkPolyData = sphere.GetOutput()
-    num_cells = polydata.GetNumberOfCells()
+def create_sliced_sphere(theta_count: int, phi_count: int, cmap="viridis") -> pv.PolyData:
+    """Create a sliced sphere using pyvista"""
+    # Create sphere using pyvista
+    sphere = pv.Sphere(theta_resolution=theta_count, phi_resolution=phi_count)
+    
+    num_cells = sphere.n_cells
     cell_id = np.arange(num_cells, dtype=np.int32)
     cell_value = cell_id.astype(np.float32)
-
+    
+    # Add cell data
+    sphere.cell_data["cell_id"] = cell_id
+    sphere.cell_data["cell_value"] = cell_value
+    
     # Use the selected colormap to map scalar values to RGB
     cmap_obj = plt.get_cmap(cmap)
     norm_values = (cell_value - cell_value.min()) / (cell_value.max() - cell_value.min())
     rgb = cmap_obj(norm_values)[:, :3]  # Get RGB (ignore alpha)
-
-    # Convert numpy arrays to VTK arrays
-    cell_id_array = vtk.util.numpy_support.numpy_to_vtk(
-        cell_id, deep=True, array_type=vtk.VTK_ID_TYPE
-    )
-    cell_value_array = vtk.util.numpy_support.numpy_to_vtk(
-        cell_value, deep=True, array_type=vtk.VTK_FLOAT
-    )
-    # Assign arrays to cell data
-    polydata.GetCellData().AddArray(cell_id_array)
-    polydata.GetCellData().AddArray(cell_value_array)
-
-    polydata.GetCellData().GetArray(0).SetName("cell_id")
-    polydata.GetCellData().GetArray(1).SetName("cell_value")
-
+    
     # Create and assign RGB array
-    set_color(polydata, cmap=cmap)
-
-    return polydata
+    set_color(sphere, cmap=cmap)
+    
+    return sphere
 
 def structured_to_polydata(grid):
-    geom = vtk.vtkGeometryFilter()
-    geom.SetInputData(grid)
-    geom.Update()
-    return geom.GetOutput()
+    """Convert structured grid to polydata using pyvista"""
+    return grid.extract_geometry()
 
 class ExamplePanel(param.Parameterized):
     def __init__(self, **params):
@@ -203,14 +189,13 @@ class ExamplePanel(param.Parameterized):
     def _update_vtp_data(self, event=None):
         print("Updating VTKPlotter data...")
         if self.geom_select.value == "structured_grid":
-            grid = create_uniform_structured_grid(
+            poly = create_uniform_structured_grid(
                 nx=self.theta_slider.value,
                 ny=self.phi_slider.value,
                 nz=self.phi_slider.value,
                 spacing=1.0 / self.theta_slider.value,
                 cmap=self.cmap_select.value,
             )
-            poly = structured_to_polydata(grid)
         else:
             poly = create_sliced_sphere(
                 theta_count=self.theta_slider.value,

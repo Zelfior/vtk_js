@@ -1,7 +1,12 @@
 import param
 from panel.custom import JSComponent
-from vtk.util.numpy_support import vtk_to_numpy
+import panel_material_ui as pmui
+
 import numpy as np
+import vtk
+
+from vtk.util.numpy_support import vtk_to_numpy
+
 
 # =============================================================================
 # Binary helpers
@@ -13,6 +18,7 @@ def _pack(arr, dtype):
 
 def _vtk_to_numpy(vtk_array):
     return vtk_to_numpy(vtk_array)
+
 
 # =============================================================================
 # VTK 9.6+ SAFE CELL EXTRACTION
@@ -54,6 +60,10 @@ def extract_cell_stream(cell):
         "buffer": memoryview(stream_np).tobytes(),
     }
 
+
+# =============================================================================
+# PolyData serialization (FAST / BINARY)
+# =============================================================================
 
 def polydata_to_dict(poly):
     """
@@ -135,17 +145,82 @@ def polydata_to_dict(poly):
     }
 
 
+# =============================================================================
+# Geometry creation
+# =============================================================================
+
+def create_uniform_structured_grid(nx, ny, nz, spacing=1.0):
+
+    grid = vtk.vtkStructuredGrid()
+    grid.SetDimensions(nx, ny, nz)
+
+    pts = vtk.vtkPoints()
+
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+
+                pts.InsertNextPoint(
+                    i * spacing,
+                    j * spacing,
+                    k * spacing,
+                )
+
+    grid.SetPoints(pts)
+    n_cells = (nx - 1) * (ny - 1) * (nz - 1)
+
+    cell_id = np.arange(n_cells, dtype=np.float32)
+
+    x = np.arange((nx - 1), dtype=np.float32) / (nx - 2)
+    y = np.arange((ny - 1), dtype=np.float32) / (ny - 2)
+    z = np.arange((nz - 1), dtype=np.float32) / (nz - 2)
+
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')  # 'ij' for Cartesian indexing
+
+    X = X.flatten()
+    Y = Y.flatten()
+    Z = Z.flatten()
+
+    rgb = np.stack(
+        [
+            X,          # red
+            Y,    # green
+            Z,    # blue
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    print(rgb.max(), rgb.min())
+
+    grid.cell_data["cell_id"] = cell_id
+    grid.cell_data["cell_value"] = X
+    grid.cell_data["rgb"] = rgb
+
+    print(grid.cell_data["rgb"])
+
+    return grid
+
+
+def structured_to_polydata(grid):
+
+    geom = vtk.vtkGeometryFilter()
+    geom.SetInputData(grid)
+    geom.Update()
+
+    return geom.GetOutput()
+
+
+# =============================================================================
+# Panel Component
+# =============================================================================
+
 class VTKPlotter(JSComponent):
 
-    geometry = param.Dict()
-    colors = param.Dict()
+    resolution = param.Integer(default=10, bounds=(4, 80))
+    cmap = param.Selector(default="viridis", objects=["viridis", "plasma", "inferno", "magma"])
+    info = param.Boolean(default=True)
 
-    info = param.Boolean(default=True, doc="Whether to show the info panel.")
-
-    hover_cell_id = param.Integer(default=-1)
-    hover_cell_value = param.Integer(default=-1)
-
-    hover_position = param.List(default=[float("nan"), float("nan"), float("nan")])
+    vtp_data = param.Dict()
 
     _importmap = {
         "imports": {
@@ -155,28 +230,58 @@ class VTKPlotter(JSComponent):
 
     _esm = "./src/app.js"
 
-    def __init__(self, **params):
+    def __init__(self, poly_data, **params):
+
         super().__init__(**params)
+        self.data = poly_data
+        self._update_vtp_data()
 
-    def update_polydata(self, polydata):
-        d = polydata_to_dict(polydata)
+        self.param.watch(self._update_vtp_data, "resolution")
+        self.param.watch(self._update_vtp_data, "cmap")
 
-        self.geometry = {
-            "points": d["points"],
-            "polys": d["polys"],
-            "lines": d["lines"],
-            "verts": d["verts"],
-            "strips": d["strips"],
-        }
+    def _update_vtp_data(self, event=None):
 
-        self.colors = {
-            "pointData": d["pointData"],
-            "cellData": d["cellData"],
-        }
-    def update_colors(self, polydata):
-        d = polydata_to_dict(polydata)
+        self.vtp_data = polydata_to_dict(self.data)
 
-        self.colors = {
-            "pointData": d["pointData"],
-            "cellData": d["cellData"],
-        }
+
+# =============================================================================
+# UI
+# =============================================================================
+
+if __name__ == "__main__":
+
+    resolution_slider = pmui.IntSlider(
+        name="Resolution",
+        start=4,
+        end=80,
+        sizing_mode="stretch_width",
+        value=10,
+    )
+
+    cmap = pmui.Select(
+        name="Colormap",
+        options=["viridis", "plasma", "inferno", "magma"],
+        sizing_mode="stretch_width",
+    )
+
+    info_checkbox = pmui.Checkbox(
+        name="Show Info",
+        value=True,
+    )
+
+    vtk_view = VTKPlotter(sizing_mode="stretch_both")
+
+    resolution_slider.link(vtk_view, value="resolution")
+    cmap.link(vtk_view, value="cmap")
+    info_checkbox.link(vtk_view, value="info")
+
+    pmui.Row(
+        pmui.Column(
+            resolution_slider,
+            cmap,
+            info_checkbox,
+            width=300,
+        ),
+        vtk_view,
+        sizing_mode="stretch_both",
+    ).show()
