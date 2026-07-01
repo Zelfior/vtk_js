@@ -139,6 +139,62 @@ def polydata_to_dict(poly):
     }
 
 
+def _convert_cells_to_polys(poly):
+    """
+    Convert cell-based PolyData to polygon surface.
+    
+    For structured grids and other datasets that don't have explicit polys,
+    we need to extract the surface or generate polygons from cells.
+    """
+    # Check if we already have polys
+    if poly.GetPolys().GetNumberOfCells() > 0:
+        return poly
+    
+    # Try to extract surface which will create proper polys
+    try:
+        return poly.extract_surface(algorithm='dataset_surface')
+    except Exception:
+        # If extract_surface fails, return original
+        return poly
+
+
+def unstructured_grid_to_dict(ugrid: pv.UnstructuredGrid):
+    """
+    Convert pyvista.UnstructuredGrid → vtk.js-friendly binary structure
+    
+    For vtk.js compatibility, we convert the unstructured grid to PolyData
+    using extract_geometry() which preserves cell data.
+    
+    Uses vtkDataSetSurfaceFilter with original cell IDs to properly map cell data.
+    """
+    import vtk
+    
+    # Use vtkDataSetSurfaceFilter which preserves original cell IDs
+    surface_filter = vtk.vtkDataSetSurfaceFilter()
+    surface_filter.SetInputData(ugrid)
+    surface_filter.Update()
+    
+    poly = pv.PolyData(surface_filter.GetOutput())
+    
+    # The filter adds 'vtkOriginalCellIds' array to point data
+    # We need to use it to map cell data from original to new cells
+    if 'vtkOriginalCellIds' in poly.cell_data:
+        original_ids = poly.cell_data['vtkOriginalCellIds'].astype(int)
+        
+        # Map each cell data array from original to new cells
+        for name, arr in ugrid.cell_data.items():
+            if len(original_ids) == len(arr):
+                # Same number of cells, direct copy
+                poly.cell_data[name] = arr
+            else:
+                # Different number of cells, use original IDs to map
+                if len(original_ids) <= len(arr):
+                    new_arr = arr[original_ids]
+                    poly.cell_data[name] = new_arr
+    
+    return polydata_to_dict(poly)
+
+
 class VTKPlotter(JSComponent):
 
     geometry = param.Dict()
@@ -162,8 +218,33 @@ class VTKPlotter(JSComponent):
     def __init__(self, **params):
         super().__init__(**params)
 
+    def _convert_mesh(self, mesh):
+        """
+        Convert various pyvista mesh types to vtk.js format.
+        
+        Supports:
+        - pv.PolyData
+        - pv.UnstructuredGrid
+        - pv.StructuredGrid (converted to PolyData)
+        - pv.RectilinearGrid (converted to PolyData)
+        - pv.ImageData (converted to PolyData)
+        """
+        if isinstance(mesh, pv.PolyData):
+            # Ensure we have polys for proper rendering
+            if mesh.GetPolys().GetNumberOfCells() == 0 and hasattr(mesh, 'extract_surface'):
+                mesh = _convert_cells_to_polys(mesh)
+            return polydata_to_dict(mesh)
+        elif isinstance(mesh, pv.UnstructuredGrid):
+            return unstructured_grid_to_dict(mesh)
+        elif isinstance(mesh, (pv.StructuredGrid, pv.RectilinearGrid, pv.ImageData)):
+            # Convert to PolyData using extract_surface for proper polygon generation
+            poly = mesh.extract_surface(algorithm='dataset_surface')
+            return polydata_to_dict(poly)
+        else:
+            raise TypeError(f"Unsupported mesh type: {type(mesh)}")
+
     def update_polydata(self, polydata):
-        d = polydata_to_dict(polydata)
+        d = self._convert_mesh(polydata)
 
         self.geometry = {
             "points": d["points"],
@@ -177,8 +258,9 @@ class VTKPlotter(JSComponent):
             "pointData": d["pointData"],
             "cellData": d["cellData"],
         }
+    
     def update_colors(self, polydata):
-        d = polydata_to_dict(polydata)
+        d = self._convert_mesh(polydata)
 
         self.colors = {
             "pointData": d["pointData"],
