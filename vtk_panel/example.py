@@ -224,6 +224,7 @@ def create_random_tetrahedral_mesh(n_tetras: int = 20, seed: int = 42, cmap="vir
 class ExamplePanel(param.Parameterized):
     def __init__(self, **params):
         super().__init__(**params)
+
         self.theta_slider = pmui.IntSlider(
             label="Resolution Theta",
             start=4,
@@ -255,6 +256,11 @@ class ExamplePanel(param.Parameterized):
         )
         
         # Clip plane controls
+        self.plane_enabled = pmui.Checkbox(
+            label="Enable Plane (V to toggle)",
+            value=False,
+            sizing_mode="stretch_width",
+        )
         self.clip_enabled = pmui.Checkbox(
             label="Enable Clip Plane (C to toggle)",
             value=False,
@@ -266,23 +272,15 @@ class ExamplePanel(param.Parameterized):
             value="z",
             sizing_mode="stretch_width",
         )
-        self.clip_position_slider = pmui.FloatSlider(
-            label="Clip Position",
-            start=-1.0,
-            end=1.0,
-            step=0.01,
-            value=0.5,
-            sizing_mode="stretch_width",
-        )
 
         self.theta_slider.param.watch(self._update_vtp_data, "value")
         self.phi_slider.param.watch(self._update_vtp_data, "value")
         self.cmap_select.param.watch(self._update_color, "value")
         self.geom_select.param.watch(self._update_vtp_data, "value")
         self.display_info.param.watch(self._update_info_display, "value")
+        self.plane_enabled.param.watch(self._update_plane_enabled, "value")
         self.clip_enabled.param.watch(self._update_clip_enabled, "value")
         self.clip_axis_select.param.watch(self._update_clip_axis, "value")
-        self.clip_position_slider.param.watch(self._update_clip_position, "value")
 
         self.poly = create_sliced_sphere(
             theta_count=self.theta_slider.value,
@@ -295,6 +293,11 @@ class ExamplePanel(param.Parameterized):
             Hover to update...
             """
         )
+        self.description_clip = pmui.Typography(
+            """
+            Enable clip to update...
+            """
+        )
 
         self.vtk_view = VTKPlotter(sizing_mode="stretch_both")
         self.vtk_view.update_polydata(self.poly)
@@ -303,13 +306,15 @@ class ExamplePanel(param.Parameterized):
         self.vtk_view.param.watch(self.update_description, "hover_cell_value")
         self.vtk_view.param.watch(self.update_description, "hover_position")
         
+        self.vtk_view.param.watch(self.update_description_clip, "clip_origin")
+        self.vtk_view.param.watch(self.update_description_clip, "clip_normal")
+        
         # Initialize clip plane from model after first geometry update
         self._init_clip_plane()
 
     def _init_clip_plane(self):
         """Initialize clip plane controls after geometry is loaded."""
         # Set initial position based on geometry bounds
-        self.clip_position_slider.value = 0.5
         self._update_clip_position()
 
     def update_description(self, event=None):
@@ -324,6 +329,21 @@ class ExamplePanel(param.Parameterized):
         - Z : {self.vtk_view.hover_position[2]:.3f}
         """
 
+    def update_description_clip(self, event=None):
+        self.description_clip.object = f"""
+        Clim origin: {self.vtk_view.hover_cell_id}
+
+        - X : {self.vtk_view.clip_origin[0]:.3f}
+        - Y : {self.vtk_view.clip_origin[1]:.3f}
+        - Z : {self.vtk_view.clip_origin[2]:.3f}
+
+        Clip axis: {self.vtk_view.hover_cell_value}
+
+        - X : {self.vtk_view.clip_normal[0]:.3f}
+        - Y : {self.vtk_view.clip_normal[1]:.3f}
+        - Z : {self.vtk_view.clip_normal[2]:.3f}
+        """
+
     def show(self):
         pmui.Row(
             pmui.Column(
@@ -332,9 +352,10 @@ class ExamplePanel(param.Parameterized):
                 self.phi_slider,
                 self.cmap_select,
 
+                self.plane_enabled,
                 self.clip_enabled,
                 self.clip_axis_select,
-                self.clip_position_slider,
+                self.description_clip,
 
                 self.display_info,
                 self.description,
@@ -382,6 +403,10 @@ class ExamplePanel(param.Parameterized):
         """Enable/disable clip plane."""
         self.vtk_view.set_clip_enabled(self.clip_enabled.value)
         
+    def _update_plane_enabled(self, event=None):
+        """Enable/disable clip plane."""
+        self.vtk_view.set_plane_enabled(self.plane_enabled.value)
+        
     def _update_clip_axis(self, event=None):
         """Set clip plane axis."""
         self.vtk_view.set_clip_axis(self.clip_axis_select.value)
@@ -401,7 +426,7 @@ class ExamplePanel(param.Parameterized):
             range_val = max_val - min_val
             
             # Position along the axis
-            pos = min_val + range_val * self.clip_position_slider.value
+            pos = min_val + range_val / 2
             
             # Create origin at this position on the selected axis
             origin = [0.0, 0.0, 0.0]

@@ -74,11 +74,27 @@ export function render({ model, el }) {
   const widget = vtkImplicitPlaneWidget.newInstance();
   widget.setPlaceFactor(1.25);
 
+  const widgetState = widget.getWidgetState();
+
+  function syncWidgetFromPlane() {
+    widgetState.setOrigin(clipOrigin);
+    widgetState.setNormal(clipNormal);
+  }
+
   // Widget manager to handle the widget
   const widgetManager = vtkWidgetManager.newInstance();
   widgetManager.setRenderer(renderer);
   const widgetInstance = widgetManager.addWidget(widget);
   widgetManager.enablePicking();
+
+  let planeEnabled = model.plane_visible !== undefined ? model.plane_visible : true;
+
+  function setPlaneWidgetVisible(enabled) {
+    planeEnabled = enabled;
+    widgetInstance.setVisibility(enabled);
+    renderWindow.render();
+  }
+  setPlaneWidgetVisible(planeEnabled);
 
   // Initialize widget with the geometry bounds after data is loaded
   function initializeWidget() {
@@ -184,6 +200,10 @@ export function render({ model, el }) {
     const state = widgetInstance.getWidgetState();
     const normal = state.getNormal();
     const origin = state.getOrigin();
+
+    clipOrigin = [origin[0], origin[1], origin[2]];
+    clipNormal = [normal[0], normal[1], normal[2]];
+
     plane.setNormal(normal[0], normal[1], normal[2]);
     plane.setOrigin(origin[0], origin[1], origin[2]);
 
@@ -301,6 +321,7 @@ export function render({ model, el }) {
 
     plane.modified();
     clipper.modified();
+    syncWidgetFromPlane();
     renderWindow.render();
   }
 
@@ -366,6 +387,7 @@ export function render({ model, el }) {
     clipOrigin = center;
     plane.setOrigin(center[0], center[1], center[2]);
     clipper.modified();
+    syncWidgetFromPlane();
     renderWindow.render();
   }
 
@@ -474,10 +496,12 @@ export function render({ model, el }) {
   window.vtkPanelClipPlane = {
     update: updateClipPlane,
     setEnabled: setClipEnabled,
+    setPlaneVisible: setPlaneWidgetVisible,
     move: moveClipPlane,
     setAxis: setClipAxis,
     getState: () => ({
       enabled: clipEnabled,
+      planeVisible: planeEnabled,
       origin: [...clipOrigin],
       normal: [...clipNormal],
     }),
@@ -536,6 +560,10 @@ export function render({ model, el }) {
         setClipAxis('z', 1);
         handled = true;
         break;
+      case 'v':
+        setPlaneWidgetVisible(!planeEnabled);
+        handled = true;
+        break;
       case 'arrowup':
       case '+':
       case '=':
@@ -589,6 +617,7 @@ export function render({ model, el }) {
     renderUpdate(true);
     // Re-initialize widget bounds when geometry changes
     initializeWidget();
+  syncWidgetFromPlane();
   });
 
   model.on("change:colors", () => {
@@ -597,6 +626,10 @@ export function render({ model, el }) {
   });
 
   model.on?.('change:info', onInfoChange);
+
+  model.on("change:plane_visible", () => {
+    setPlaneWidgetVisible(model.plane_visible);
+  });
 
   // ----------------------------------------------------------------------------
   // Resize handling
