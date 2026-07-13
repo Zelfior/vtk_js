@@ -161,8 +161,10 @@ export function render({ model, el }) {
 
   const prop = actor.getProperty();
   prop.setRepresentationToSurface();
-  prop.setEdgeVisibility(true);
-  prop.setEdgeColor(0, 0, 0);
+  // Edges are no longer drawn by VTK's flat-color edge rendering - see the
+  // "Feature Edges" section below, which draws a colored, cell_id-aware
+  // edge overlay instead.
+  prop.setEdgeVisibility(false);
   prop.setAmbient(0.2);
   prop.setDiffuse(0.8);
   prop.setSpecular(0.1);
@@ -195,8 +197,7 @@ export function render({ model, el }) {
 
   const clipProp = clipActor.getProperty();
   clipProp.setRepresentationToSurface();
-  clipProp.setEdgeVisibility(true);
-  clipProp.setEdgeColor(0, 0, 0);
+  clipProp.setEdgeVisibility(false);
   clipProp.setAmbient(0.2);
   clipProp.setDiffuse(0.8);
   clipProp.setSpecular(0.1);
@@ -235,8 +236,7 @@ export function render({ model, el }) {
 
   const capProp = capActor.getProperty();
   capProp.setRepresentationToSurface();
-  capProp.setEdgeVisibility(true);
-  capProp.setEdgeColor(0, 0, 0);
+  capProp.setEdgeVisibility(false);
   capProp.setAmbient(0.3);
   capProp.setDiffuse(0.7);
   capProp.setSpecular(0.0);
@@ -247,8 +247,225 @@ export function render({ model, el }) {
   capActor.setVisibility(false);
   renderer.addActor(capActor);
 
+  // ----------------------------------------------------------------------------
+  // Feature Edges
+  //
+  // VTK's built-in EdgeVisibility draws every triangle edge in one flat
+  // color - visually flat, and noisy on triangulated meshes since every
+  // triangulation edge shows, not just meaningful ones. Instead we build our
+  // own thin line geometry per surface (main / clipped / cap) containing
+  // only:
+  //   - mesh boundary edges (used by exactly one triangle), and
+  //   - edges shared by two triangles whose 'cell_id' differ.
+  // Internal triangulation edges within the same cell_id are skipped
+  // entirely. Each edge is colored from its adjacent face color(s),
+  // darkened by a fixed amount, so edge color tracks face color instead of
+  // being flat black.
+  //
+  // `cell_id` and `rgb` are both cell-indexed arrays, one entry per polygon
+  // in the same order as the `polys` connectivity (see the python side's
+  // `polydata_to_dict`), which is what makes matching edges to their owning
+  // cell's data straightforward.
+  // ----------------------------------------------------------------------------
+
+  const EDGE_DARKEN_FRACTION = 0.5; // "color - 40%", i.e. multiply by 0.6
+
+  function darkenRGB(tuple) {
+    return tuple.map((v) => v * (1 - EDGE_DARKEN_FRACTION));
+  }
+
+  // Parse a vtk.js CellArray (legacy flat format: n, id0..idn-1, n, ...)
+  // into an array of point-id arrays, one per cell.
+  function parseCellsPointIds(cellArray) {
+    if (!cellArray || cellArray.getNumberOfCells() === 0) return [];
+    const data = cellArray.getData();
+    const cells = [];
+    let i = 0;
+    while (i < data.length) {
+      const n = data[i];
+      const pts = new Array(n);
+      for (let k = 0; k < n; k++) pts[k] = data[i + 1 + k];
+      cells.push(pts);
+      i += n + 1;
+    }
+    return cells;
+  }
+
+  /**
+   * Build { points, lines, colors } describing the feature edges of
+   * `sourcePolyData`'s polys. Returns null if there's nothing to draw (no
+   * polys at all).
+   */
+  function buildFeatureEdges(sourcePolyData) {
+    const polys = sourcePolyData?.getPolys();
+    const points = sourcePolyData?.getPoints();
+    if (!polys || polys.getNumberOfCells() === 0 || !points) return null;
+
+    const cd = sourcePolyData.getCellData();
+    const cellIdArray = cd.getArrayByName('cell_id');
+    const rgbArray = cd.getArrayByName('rgb');
+
+    // Cell data is indexed across verts+lines+polys+strips in that order,
+    // so a poly at local index `k` sits at global cell id `cellOffset + k`.
+    const cellOffset =
+      sourcePolyData.getVerts().getNumberOfCells() +
+      sourcePolyData.getLines().getNumberOfCells();
+
+    const cellsPointIds = parseCellsPointIds(polys);
+
+    // edgeKey "a_b" (a < b) -> owning poly-local cell indices
+    const edgeOwners = new Map();
+    cellsPointIds.forEach((pts, cellIdx) => {
+      const n = pts.length;
+      for (let k = 0; k < n; k++) {
+        const a = pts[k];
+        const b = pts[(k + 1) % n];
+        const key = a < b ? `${a}_${b}` : `${b}_${a}`;
+        let owners = edgeOwners.get(key);
+        if (!owners) {
+          owners = [];
+          edgeOwners.set(key, owners);
+        }
+        owners.push(cellIdx);
+      }
+    });
+
+    const linePairs = [];
+    const lineColors = [];
+
+    edgeOwners.forEach((owners, key) => {
+      let colorTuple = null;
+
+      if (owners.length === 1) {
+        // Mesh boundary edge - always shown.
+        const g = cellOffset + owners[0];
+        colorTuple = rgbArray ? Array.from(rgbArray.getTuple(g)) : [0, 0, 0];
+      } else {
+        // Shared by 2+ triangles (2 for a manifold mesh; for non-manifold
+        // meshes just compare the first two owners). Only show it if the
+        // owning cells belong to different logical cell_id groups.
+        const [c0, c1] = owners;
+        const g0 = cellOffset + c0;
+        const g1 = cellOffset + c1;
+        const id0 = cellIdArray ? cellIdArray.getValue(g0) : g0;
+        const id1 = cellIdArray ? cellIdArray.getValue(g1) : g1;
+        if (id0 !== id1) {
+          const rgb0 = rgbArray ? Array.from(rgbArray.getTuple(g0)) : [0, 0, 0];
+          const rgb1 = rgbArray ? Array.from(rgbArray.getTuple(g1)) : [0, 0, 0];
+          colorTuple = rgb0.map((v, i) => (v + rgb1[i]) / 2);
+        }
+      }
+
+      if (colorTuple) {
+        const [a, b] = key.split('_').map(Number);
+        linePairs.push(a, b);
+        const dark = darkenRGB(colorTuple);
+        lineColors.push(dark[0]*255, dark[1]*255, dark[2]*255);
+      }
+    });
+
+    if (linePairs.length === 0) return null;
+
+    const numEdges = linePairs.length / 2;
+    const linesFlat = new Uint32Array(numEdges * 3);
+    for (let e = 0; e < numEdges; e++) {
+      linesFlat[e * 3] = 2;
+      linesFlat[e * 3 + 1] = linePairs[e * 2];
+      linesFlat[e * 3 + 2] = linePairs[e * 2 + 1];
+    }
+
+    return {
+      points: points.getData(), // reuse the source's own point buffer directly
+      lines: linesFlat,
+      colors: new Uint8Array(lineColors),
+    };
+  }
+
+  function makeEdgeActor() {
+    const edgePolyData = vtkPolyData.newInstance();
+    const edgeMapper = vtkMapper.newInstance();
+    edgeMapper.setInputData(edgePolyData);
+    edgeMapper.setScalarVisibility(true);
+    edgeMapper.setScalarModeToUseCellFieldData();
+    edgeMapper.setColorModeToDirectScalars();
+    edgeMapper.setColorByArrayName('rgb');
+
+    const edgeActor = vtkActor.newInstance();
+    edgeActor.setMapper(edgeMapper);
+    edgeActor.getProperty().setLighting(false);
+    edgeActor.getProperty().setLineWidth(1.5);
+    edgeActor.setVisibility(false);
+    renderer.addActor(edgeActor);
+
+    return { edgePolyData, edgeActor };
+  }
+
+  const { edgePolyData: mainEdgePolyData, edgeActor: mainEdgeActor } = makeEdgeActor();
+  const { edgePolyData: clipEdgePolyData, edgeActor: clipEdgeActor } = makeEdgeActor();
+  const { edgePolyData: capEdgePolyData, edgeActor: capEdgeActor } = makeEdgeActor();
+
+  let hasMainEdges = false;
+  let hasClipEdges = false;
+  let hasCapEdges = false;
+
+  // Edge actors mirror the visibility of the surface they belong to (no
+  // point showing clip edges while the clipped body itself is hidden).
+  function syncEdgeVisibility() {
+    mainEdgeActor.setVisibility(hasMainEdges && actor.getVisibility());
+    clipEdgeActor.setVisibility(hasClipEdges && clipActor.getVisibility());
+    capEdgeActor.setVisibility(hasCapEdges && capActor.getVisibility());
+  }
+
+  function loadEdgesInto(sourcePolyData, targetEdgePolyData) {
+    const built = buildFeatureEdges(sourcePolyData);
+    if (!built) return false;
+
+    const pointsObj = vtkPoints.newInstance();
+    pointsObj.setData(built.points, 3);
+    targetEdgePolyData.setPoints(pointsObj);
+
+    const linesArr = vtkCellArray.newInstance();
+    linesArr.setData(built.lines);
+    targetEdgePolyData.setLines(linesArr);
+
+    const cellD = targetEdgePolyData.getCellData();
+    cellD.initialize();
+    const colorArr = vtkDataArray.newInstance({
+      name: 'rgb',
+      values: built.colors,
+      numberOfComponents: 3,
+    });
+    cellD.addArray(colorArr);
+    cellD.setScalars(colorArr);
+    cellD.modified();
+
+    targetEdgePolyData.modified();
+    return true;
+  }
+
+  // Recomputing is O(triangle count) - cheap enough to call after any
+  // "settled" change (load, color update, mouse-release on the clip
+  // widget), but deliberately NOT wired into the continuous drag callback
+  // (`onInteractionEvent`) to avoid re-parsing the whole clipped mesh on
+  // every mouse-move frame. During an active drag the clip edges simply
+  // stay as they were until the mouse is released.
+  function refreshMainEdges() {
+    hasMainEdges = loadEdgesInto(polyData, mainEdgePolyData);
+    syncEdgeVisibility();
+  }
+  function refreshClipEdges() {
+    hasClipEdges = loadEdgesInto(clipper.getOutputData(), clipEdgePolyData);
+    syncEdgeVisibility();
+  }
+  function refreshCapEdges() {
+    hasCapEdges = hasCapSlice ? loadEdgesInto(capPolyData, capEdgePolyData) : false;
+    syncEdgeVisibility();
+  }
+
   function updateCapVisibility() {
     capActor.setVisibility(clipEnabled && hasCapSlice);
+    syncPickList();
+    syncEdgeVisibility();
   }
 
   // Clip plane control state
@@ -272,6 +489,7 @@ export function render({ model, el }) {
     // be wrong for the plane position we're moving to, so hide it until
     // python sends a fresh slice for the new plane.
     capActor.setVisibility(false);
+    syncPickList();
   });
 
   widgetInstance.onInteractionEvent(() => {
@@ -295,6 +513,7 @@ export function render({ model, el }) {
     // plane state, which triggers it to recompute the data-accurate cap
     // slice (plane ∩ real mesh) and send it back via `clip_slice`.
     syncClipStateToModel();
+    refreshClipEdges();
   });
 
   // ----------------------------------------------------------------------------
@@ -303,11 +522,28 @@ export function render({ model, el }) {
 
   const picker = vtkCellPicker.newInstance();
   picker.setPickFromList(true);
-  picker.initializePickList();
-  picker.setTolerance(1e-4);
-  picker.addPickList(actor);
-  picker.addPickList(clipActor); // so hover still works when clip is enabled
-  picker.addPickList(capActor); // and on the data-accurate cap surface too
+  // The default tolerance is a fairly generous world-space radius, meaning
+  // the picker can snap to a *neighboring* cell instead of the one literally
+  // under the cursor (especially on dense meshes, thin cells, or shallow
+  // viewing angles). Tightening it makes picks track the exact cell more
+  // reliably.
+  picker.setTolerance(0.0005);
+
+  // Keep the pick list limited to actors that are actually visible right
+  // now. Previously all three actors (actor / clipActor / capActor) stayed
+  // in the list permanently, even the ones hidden by setClipEnabled/
+  // updateCapVisibility. Where a hidden actor's geometry sits behind or
+  // coincident with the visible one, the picker could resolve a hit against
+  // the *hidden* actor's cell - same screen location, wrong cell/dataset -
+  // which shows up as an intermittently "off" hover/highlight, especially
+  // near the clip boundary. Call this any time visibility changes.
+  function syncPickList() {
+    picker.initializePickList();
+    if (actor.getVisibility()) picker.addPickList(actor);
+    if (clipActor.getVisibility()) picker.addPickList(clipActor);
+    if (capActor.getVisibility()) picker.addPickList(capActor);
+  }
+  syncPickList();
 
   // ----------------------------------------------------------------------------
   // Update PolyData
@@ -441,9 +677,11 @@ export function render({ model, el }) {
 
     plane.modified();
     clipper.modified();
+    refreshClipEdges();
     // The current cap slice no longer matches this plane position; hide it
     // until python computes a fresh one (see `change:clip_slice` handler).
     capActor.setVisibility(false);
+    syncPickList();
     syncWidgetFromPlane();
     renderWindow.render();
   }
@@ -538,6 +776,9 @@ export function render({ model, el }) {
   // Initialize the widget with current geometry (after data is loaded)
   initializeWidget();
 
+  refreshMainEdges();
+  refreshClipEdges();
+
   // ----------------------------------------------------------------------------
   // Hover picking + hover cell highlight
   // ----------------------------------------------------------------------------
@@ -551,15 +792,16 @@ export function render({ model, el }) {
   // original tuple when the hover moves off. This is cheap (touches a
   // single tuple) and works correctly no matter which of the three actors
   // was actually picked.
-  const HOVER_DARKEN_OFFSET = 30. / 255.;
+  const HOVER_DARKEN_OFFSET = 20 / 255;
   let highlight = null; // { array, cellId, original, dataset }
 
   function darkenTuple(tuple) {
     const out = new Array(tuple.length);
     for (let i = 0; i < tuple.length; i++) {
+      // Leave an alpha component (4th channel), if present, untouched.
       out[i] = (tuple.length === 4 && i === 3)
         ? tuple[i]
-        : Math.max(0, tuple[i] - HOVER_DARKEN_OFFSET);
+        : Math.max(0, Math.min(1, tuple[i] - HOVER_DARKEN_OFFSET));
     }
     return out;
   }
@@ -826,6 +1068,7 @@ export function render({ model, el }) {
     if (highlight && highlight.dataset === capPolyData) clearHighlight();
     updateCapSlice(model.clip_slice);
     updateCapVisibility();
+    refreshCapEdges();
     renderWindow.render();
   });
 
@@ -846,6 +1089,8 @@ export function render({ model, el }) {
     // Re-initialize widget bounds when geometry changes
     initializeWidget();
     syncWidgetFromPlane();
+    refreshMainEdges();
+    refreshClipEdges();
   });
 
   model.on("change:colors", () => {
@@ -853,6 +1098,8 @@ export function render({ model, el }) {
     lastHover = { cellId: -2, cellValue: null, position: [NaN, NaN, NaN], dataset: null };
     updateScalars(model.colors);
     renderUpdate(false);
+    refreshMainEdges();
+    refreshClipEdges();
   });
 
   model.on?.('change:info', onInfoChange);
