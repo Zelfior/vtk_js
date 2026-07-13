@@ -226,13 +226,13 @@ class VTKPlotter(JSComponent):
 
     plane_visible = param.Boolean(default=False, doc="Plane visualization visible")
 
-    _importmap = {
-        "imports": {
-            "@kitware/vtk.js": "https://esm.sh/@kitware/vtk.js@35.15.1",
-        }
-    }
+    # _importmap = {
+    #     "imports": {
+    #         "@kitware/vtk.js": "https://esm.sh/@kitware/vtk.js@35.15.1",
+    #     }
+    # }
 
-    _esm = "./src/app.js"
+    _esm = "./VTKPlotter.bundle.js"
 
     def __init__(self, **params):
         super().__init__(**params)
@@ -380,7 +380,6 @@ class VTKPlotter(JSComponent):
                 origin=self.clip_origin,
                 generate_triangles=True,
             )
-            print(mesh_slice)
         except Exception:
             # A degenerate plane (e.g. missing the mesh entirely) shouldn't
             # crash the app - just fall back to "no cap available".
@@ -392,10 +391,6 @@ class VTKPlotter(JSComponent):
             return
 
         d = self._convert_mesh(mesh_slice)
-
-        print(type(self._source_mesh), self._source_mesh.n_cells)
-        if hasattr(self._source_mesh, "get_cell"):
-            print(self._source_mesh.get_cell(0).type)
 
         self.clip_slice = {
             "points": d["points"],

@@ -35,6 +35,11 @@ export function render({ model, el }) {
 
   const renderer = genericRenderWindow.getRenderer();
   const renderWindow = genericRenderWindow.getRenderWindow();
+  // The real OpenGL render window - used to translate CSS mouse coordinates
+  // into the framebuffer's actual pixel space (see onMouseMove / picking
+  // fix below). Its size can differ from el.getBoundingClientRect() by
+  // window.devicePixelRatio on hi-DPI displays.
+  const openGLRenderWindow = genericRenderWindow.getApiSpecificRenderWindow();
 
   renderer.setBackground(1, 1, 1);
 
@@ -244,7 +249,6 @@ export function render({ model, el }) {
 
   function updateCapVisibility() {
     capActor.setVisibility(clipEnabled && hasCapSlice);
-    console.log(clipEnabled && hasCapSlice);
   }
 
   // Clip plane control state
@@ -300,6 +304,7 @@ export function render({ model, el }) {
   const picker = vtkCellPicker.newInstance();
   picker.setPickFromList(true);
   picker.initializePickList();
+  picker.setTolerance(1e-4);
   picker.addPickList(actor);
   picker.addPickList(clipActor); // so hover still works when clip is enabled
   picker.addPickList(capActor); // and on the data-accurate cap surface too
@@ -534,12 +539,54 @@ export function render({ model, el }) {
   initializeWidget();
 
   // ----------------------------------------------------------------------------
-  // Hover picking
+  // Hover picking + hover cell highlight
   // ----------------------------------------------------------------------------
   let hoverEnabled = !!model.info;
-  let lastHover = { cellId: -2, cellValue: null, position: [NaN, NaN, NaN] };
+  let lastHover = { cellId: -2, cellValue: null, position: [NaN, NaN, NaN], dataset: null };
 
-  function updateHover(cellId, cellValue, world) {
+  // --- Cell highlight state -----------------------------------------------
+  // We darken the *actual* rgb cell-color tuple of whichever cell is under
+  // the cursor, directly in whatever dataset it belongs to (the main
+  // polyData, the clipper's output, or the cap slice) and restore the
+  // original tuple when the hover moves off. This is cheap (touches a
+  // single tuple) and works correctly no matter which of the three actors
+  // was actually picked.
+  const HOVER_DARKEN_OFFSET = 30. / 255.;
+  let highlight = null; // { array, cellId, original, dataset }
+
+  function darkenTuple(tuple) {
+    const out = new Array(tuple.length);
+    for (let i = 0; i < tuple.length; i++) {
+      out[i] = (tuple.length === 4 && i === 3)
+        ? tuple[i]
+        : Math.max(0, tuple[i] - HOVER_DARKEN_OFFSET);
+    }
+    return out;
+  }
+
+  function clearHighlight() {
+    if (!highlight) return;
+    const { array, cellId, original, dataset } = highlight;
+    array.setTuple(cellId, original);
+    array.modified();
+    dataset.modified();
+    highlight = null;
+  }
+
+  function applyHighlight(dataset, cellId) {
+    if (!dataset || cellId < 0) return;
+    const cd = dataset.getCellData();
+    const array = cd.getArrayByName('rgb');
+    if (!array || cellId >= array.getNumberOfTuples()) return;
+
+    const original = Array.from(array.getTuple(cellId));
+    highlight = { array, cellId, original, dataset };
+    array.setTuple(cellId, darkenTuple(original));
+    array.modified();
+    dataset.modified();
+  }
+
+  function updateHover(cellId, cellValue, world, dataset = null) {
     const x = world?.[0] ?? NaN;
     const y = world?.[1] ?? NaN;
     const z = world?.[2] ?? NaN;
@@ -547,6 +594,7 @@ export function render({ model, el }) {
     if (
       lastHover.cellId === cellId &&
       lastHover.cellValue === cellValue &&
+      lastHover.dataset === dataset &&
       lastHover.position[0] === x &&
       lastHover.position[1] === y &&
       lastHover.position[2] === z
@@ -554,7 +602,15 @@ export function render({ model, el }) {
       return;
     }
 
-    lastHover = { cellId, cellValue, position: [x, y, z] };
+    // Swap the darken-highlight to the newly hovered cell (if any).
+    if (highlight && (highlight.dataset !== dataset || highlight.cellId !== cellId)) {
+      clearHighlight();
+    }
+    if (dataset && cellId >= 0 && !highlight) {
+      applyHighlight(dataset, cellId);
+    }
+
+    lastHover = { cellId, cellValue, position: [x, y, z], dataset };
     model.hover_cell_id = cellId;
     model.hover_cell_value = cellValue ?? -1;
     model.hover_position = [x, y, z];
@@ -563,28 +619,56 @@ export function render({ model, el }) {
   function onMouseMove(e) {
     if (!hoverEnabled) return;
     const rect = el.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const vtkY = rect.height - y;
 
-    picker.pick([x, vtkY, 0], renderer);
+    // CSS-pixel offset within the container - used only for tooltip DOM
+    // placement, which must stay in CSS pixels.
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+
+    // ------------------------------------------------------------------
+    // Coordinate fix: the OpenGL render window's actual framebuffer can
+    // be a different pixel size than el's CSS bounding rect (e.g. on any
+    // display with devicePixelRatio != 1). Picking must happen in the
+    // framebuffer's own pixel space, so we scale CSS coords by the ratio
+    // between the real canvas size and its CSS size, rather than assuming
+    // a 1:1 mapping. This is what was causing the growing offset between
+    // the cursor and the picked point.
+    // ------------------------------------------------------------------
+    const [canvasWidth, canvasHeight] = openGLRenderWindow.getSize();
+    const scaleX = canvasWidth / rect.width;
+    const scaleY = canvasHeight / rect.height;
+
+    const pickX = cssX * scaleX;
+    const pickY = canvasHeight - cssY * scaleY; // vtk's Y axis is bottom-up
+
+    picker.pick([pickX, pickY, 0], renderer);
     const pickedCellId = picker.getCellId();
 
     if (pickedCellId < 0) {
       tooltip.style.display = 'none';
-      updateHover(-1, -1, null);
+      updateHover(-1, -1, null, null);
       return;
     }
 
     const world = picker.getPickPosition();
-    const cellData = polyData.getCellData();
+
+    // Use the dataset that was actually picked (polyData / clipper output /
+    // capPolyData) rather than always reading from the original polyData -
+    // clipActor and capActor have their own cell indexing.
+    const dataset =
+      (picker.getDataSet && picker.getDataSet()) ||
+      (picker.getMapper() && picker.getMapper().getInputData()) ||
+      polyData;
+
+    const cellData = dataset.getCellData();
     const cellIdArray = cellData.getArrayByName('cell_id');
     const rgbaArray = cellData.getArrayByName('rgba');
 
     const cellValue = cellIdArray ? cellIdArray.getValue(pickedCellId) : 'N/A';
     const rgba = rgbaArray ? rgbaArray.getTuple(pickedCellId) : null;
 
-    updateHover(pickedCellId, cellValue, world);
+    updateHover(pickedCellId, cellValue, world, dataset);
+    renderWindow.render();
 
     tooltip.innerHTML = `
       <div><b>cell_id</b>: ${pickedCellId}</div>
@@ -593,19 +677,25 @@ export function render({ model, el }) {
       ${rgba ? `<div><b>rgba</b>: ${rgba.map(v => Math.round(v)).join(', ')}</div>` : ''}
     `;
 
-    tooltip.style.left = `${x + 12}px`;
-    tooltip.style.top = `${y + 12}px`;
+    tooltip.style.left = `${cssX + 12}px`;
+    tooltip.style.top = `${cssY + 12}px`;
     tooltip.style.display = 'block';
   }
 
   function onMouseLeave() {
     tooltip.style.display = 'none';
-    updateHover(-1, -1, null);
+    updateHover(-1, -1, null, null);
+    renderWindow.render();
   }
 
   function enableHover(enable) {
     hoverEnabled = enable;
     tooltip.style.display = 'none';
+    if (!enable) {
+      clearHighlight();
+      lastHover = { cellId: -2, cellValue: null, position: [NaN, NaN, NaN], dataset: null };
+      renderWindow.render();
+    }
   }
 
   el.addEventListener('mousemove', onMouseMove);
@@ -731,13 +821,20 @@ export function render({ model, el }) {
   // The data-accurate cap slice computed by python (plane ∩ real mesh).
   // Once it lands, show it (if clipping is currently enabled).
   model.on("change:clip_slice", () => {
+    // The old cap dataset (and any highlight referencing it) is about to
+    // be replaced - drop the stale reference.
+    if (highlight && highlight.dataset === capPolyData) clearHighlight();
     updateCapSlice(model.clip_slice);
-    console.log(model.clip_slice)
     updateCapVisibility();
     renderWindow.render();
   });
 
   model.on("change:geometry", () => {
+    // The whole pipeline's datasets get rebuilt - any in-progress highlight
+    // is now stale.
+    clearHighlight();
+    lastHover = { cellId: -2, cellValue: null, position: [NaN, NaN, NaN], dataset: null };
+
     updateGeometry(model.geometry);
     // New geometry invalidates whatever cap slice we had.
     hasCapSlice = false;
@@ -752,6 +849,8 @@ export function render({ model, el }) {
   });
 
   model.on("change:colors", () => {
+    clearHighlight();
+    lastHover = { cellId: -2, cellValue: null, position: [NaN, NaN, NaN], dataset: null };
     updateScalars(model.colors);
     renderUpdate(false);
   });
